@@ -1,5 +1,5 @@
 import puppeteer, { Page } from "puppeteer";  
-import fs from "fs/promises";
+import fs from "fs";
 import cron from "node-cron";
 import requestBatchProcess from "./request-batch.js";   
 import model from "./model-relaciones.js"
@@ -11,6 +11,8 @@ async function openBrowser(){
     const page = await browser.newPage();
     //Le decimos a donde iremos al navegador, es la vista de todas las tesis
     await page.goto('https://sjf2.scjn.gob.mx/busqueda-principal-tesis');
+    //Agrandamos el viewport
+    await page.setViewport({width:1920,height:1080});
     //Damos click aqui para ver todas las tesis
     await page.click('.butAll');
     // En teoria el meotodo pasado deberia funcionar tambien para dar click al 'button-addon1_add' pero no es posible,
@@ -18,20 +20,66 @@ async function openBrowser(){
     await page.evaluate(()=> document.querySelector('#button-addon1_add').click());
     //Promesa que hacemos en lo que la pagina termina de cargar
     await timer();
+    //Hacemos un ordenamiento ascendente (mas viejo al mas reciente), 
+    //asi los que se puedan ir agregando con el tiempo no deberian afectar.
+    await page.click('#mat-select-2');
+    //Esperamos aque salgo el menu de ordenamiento
+    await timer();
+    //damos click al ordenamiento que queremos.
+    await page.evaluate(()=> document.querySelectorAll('.mat-option-text')[1].click());
+    //Esperamos a que ordene
+    await timer();
+    //Debemos checar si se quedo con algun registro incompleto.
+    let paginaPersistencia = await movePointer(page);
     //Damos click a la primera referencia que se encuentre de una tesis, para verla completa
     const cadena = await page.evaluate(() => document.querySelectorAll("mat-selection-list > .text-center")[1].innerText);
     //Se obtiene la cantidad exacta de tesis que se necesitan recopilar
     const totalTesis = parseInt(cadena.match(/([\d])+/g)[2]);
     //El total de vueltas que se haran, para ir dandole una pausa cada 1000
-    const real = parseInt((totalTesis/1000))+1;
+    const real = parseInt((totalTesis/20))+1;
     //Damos clic en el boton para ingresar a la primera tesis cargada
     await page.click("#linkVisit");
     //Promesa que hacemos en lo que la pagina termina de cargar
     await timer();
-    for (let index = 0; index < real; index++) {
-        let arr = await getTesis(100,page); 
-        await fs.writeFile(`fichero-tesis-${index}.json`,JSON.stringify(arr),null,3);
- }
+    //Asignamos el valor del index
+    let index = paginaPersistencia?paginaPersistencia:0;
+    let jsonHelper = {pagina:index,ficheros:[]};
+    for (index; index < real; index++) {
+        let arr = await getTesis(20,page); 
+        jsonHelper.pagina = (index + 1);
+        jsonHelper.ficheros.push(`fichero-tesis-${index}.json`);
+        await fs.promises.writeFile(`helper.json`,JSON.stringify(jsonHelper),null,3);
+        await fs.promises.writeFile(`fichero-tesis-${index}.json`,JSON.stringify(arr),null,3);
+    }
+}
+
+/**
+ * Funcion asincrona que lo que hace es regresar un arreglo de json que contienen las tesis, asi como informacion relevante de la tesis.
+ * @param {Page} page - Debe enviarse la pagina para poder acceder a los elementos HTML.
+ * @returns {Array} -Arreglo de JSON obtenidos de las iteraciones.
+ */
+async function movePointer(page){
+    if(!fs.existsSync('helper.json'))return 0;
+    const fichero = await fs.promises.readFile('helper.json');
+    const persistencia = JSON.parse(fichero);
+    let paginaPersistencia = 0;
+    if(persistencia){
+        paginaPersistencia = persistencia.pagina;
+        let flagPageFound = true;
+        do{
+            const values = await page.evaluate(() => 
+                 [...document.querySelectorAll('li[class="page-item ng-star-inserted"] ,li[class="page-item active"]')]
+                .map(element => element.innerText));
+           const index = values.indexOf(paginaPersistencia.toString());
+            const elemets = await page.$$('li[class="page-item ng-star-inserted"] ,li[class="page-item active"]');
+            if(index != -1){ 
+                elemets[index].click();
+                flagPageFound = false;
+            }else elemets.slice(-1)[0].click();
+            await timer(5000);
+        }while(flagPageFound);
+    }
+    return paginaPersistencia;
 }
 
 /**
@@ -73,7 +121,7 @@ async function weeklyRoutine(){
 
     const arr = await getTesis(total,page);
 
-    await fs.writeFile('nuevas_tesis.json',JSON.stringify(arr),null,3);
+    await fs.promises.writeFIle('nuevas_tesis.json',JSON.stringify(arr),null,3);
 
     page.close();
 
@@ -93,7 +141,8 @@ async function getTesis(iteraciones,page){
             let body = {};
             [...document.querySelectorAll('.Temp')].map(e=> e.innerText).map(e=> e.split(': ')).forEach(elem =>{
                 if(elem.length > 1){
-                    const key = elem[0].replaceAll(' ','_').replaceAll('(s)','s').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                    const key = elem[0].replaceAll(' ','_').replaceAll('(s)','s').toLowerCase()
+                    .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
                     body[`${key}`] = elem[1].replaceAll("\\n",'');
                 }else{
                     body.epoca = elem[0].replaceAll("\\n",'');
@@ -113,7 +162,6 @@ async function getTesis(iteraciones,page){
              }
              return body;
         });
-        element.iteracion = index;
         arr.push(element);
 
         const ahead = await page.evaluate(() => {
@@ -194,27 +242,22 @@ async function getRelaciones(page, materia) {
         arr.push({relaciones,'registro_digital':tesis.trim(),index});
     await page.evaluate(()=>document.querySelector('.icon-derecha').parentElement.click());
     await timer();
-    await fs.writeFile(`relaciones-${materia}.json`,JSON.stringify(arr),null,3);
+    await fs.promises.writeFIle(`relaciones-${materia}.json`,JSON.stringify(arr),null,3);
     }
-    console.log('finalized');
 }
 
 async function startRequest(){
-    const contenido = await fs.readFile('fichero-tesis-0.json');
+    const contenido = await fs.promises.readFile('fichero-tesis-0.json');
     const response = await requestBatchProcess(contenido);
     if(response.status == 200) {
         console.log('La informacion llego correctamente');
     }
 }
 
-//openBrowser();
+openBrowser();
 //weeklyRoutine();
+    console.log(`el index quedo en ${index}`);
 //startingGetRelations();
 //Se hace una tarea programada, para que cada 6to dia a las 23:59 se dispare el evento de recolectar las nuevas tesis de manera semanal
 //cron.schedule('59 23 * * */6', () => weeklyRoutine());
-
-//document.querySelectorAll('table[template-pagination="custom/pager/articulos"] > tbody > tr > td.bg-gray-strong, td.font-bold')
-//.map(e => e.innerText).map(e => e.split('.')[0]).map(e=> e.trim());
-//icon-derecha,
-//icon-marcar-todo,
-startRequest();
+//startRequest();
